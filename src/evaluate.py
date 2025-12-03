@@ -6,16 +6,18 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from src.data_processor import DataProcessor
 from src.model import BiLSTM
 
-def evaluate():
+import argparse
+
+def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     # Hyperparameters (must match train.py)
     BATCH_SIZE = 32
-    INPUT_WINDOW = 336
-    OUTPUT_WINDOW = 72
+    INPUT_WINDOW = 144
+    OUTPUT_WINDOW = output_window
     HIDDEN_SIZE = 128
     LAYERS = 2
     DATA_DIR = "/Users/sk/Desktop/proj"
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
     
     # Load Data
     processor = DataProcessor(data_dir=DATA_DIR, input_window=INPUT_WINDOW, output_window=OUTPUT_WINDOW)
@@ -24,28 +26,20 @@ def evaluate():
     # Load Model
     input_size = X_test.shape[2]
     model = BiLSTM(input_size, HIDDEN_SIZE, OUTPUT_WINDOW, num_layers=LAYERS).to(device)
-    model.load_state_dict(torch.load("models/bilstm_model.pth", map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     
     # Predict
-    print("Generating predictions...")
+    print(f"Generating predictions for {OUTPUT_WINDOW}h horizon...")
     X_tensor = torch.Tensor(X_test).to(device)
     with torch.no_grad():
         y_pred = model(X_tensor).cpu().numpy()
         
     # Inverse Transform
-    # We need to inverse transform only the target column.
-    # The scaler was fitted on all feature columns.
-    # We can reconstruct a dummy array to inverse transform.
-    
     scaler = processor.scalers['global']
     target_idx = processor.feature_columns.index(processor.target_column)
     
     def inverse_transform_target(y_scaled):
-        # y_scaled shape: (samples, output_window)
-        # We need to apply inverse transform for each timestep
-        # Construct a dummy matrix of shape (samples * output_window, n_features)
-        
         n_features = len(processor.feature_columns)
         y_flat = y_scaled.flatten()
         
@@ -70,49 +64,77 @@ def evaluate():
     # Normalized RMSE (using mean of true data)
     nrmse = rmse / np.mean(y_test_inv)
     
-    # Skill Score vs Persistence
-    # Persistence: Predict the last 3 days (72h) for the next 3 days
-    # Input window is 336h. Last 72h of input.
+    # R2 Score (Coefficient of Determination)
+    # R2 = 1 - (SS_res / SS_tot)
+    ss_res = np.sum((y_test_inv - y_pred_inv) ** 2)
+    ss_tot = np.sum((y_test_inv - np.mean(y_test_inv)) ** 2)
+    r2 = 1 - (ss_res / ss_tot)
     
-    # Extract target feature from X_test (last 72 timesteps)
-    X_test_target_scaled = X_test[:, -72:, target_idx]
-    y_persistence_inv = inverse_transform_target(X_test_target_scaled)
+    # Skill Score vs Persistence
+    # Persistence: Predict the last output_window hours for the next output_window hours?
+    # Or just last 24h repeated?
+    # Simple persistence: Last observed value repeated?
+    # Given the prompt "Predict the last 3 days (72h) for the next 3 days" in original code.
+    # We will adapt persistence to use the last `output_window` of input as the prediction.
+    
+    # Persistence: Predict the last value repeated for the horizon
+    # This avoids shape mismatch if Output Window > Input Window
+    last_values = X_test[:, -1, target_idx] # Shape: (Batch,)
+    y_persistence_scaled = np.tile(last_values.reshape(-1, 1), (1, OUTPUT_WINDOW)) # Shape: (Batch, Output)
+    y_persistence_inv = inverse_transform_target(y_persistence_scaled)
     
     rmse_persistence = np.sqrt(mean_squared_error(y_test_inv, y_persistence_inv))
     skill_score = 1 - (rmse / rmse_persistence)
     
-    print(f"\nEvaluation Results:")
+    print(f"\nEvaluation Results ({OUTPUT_WINDOW}h):")
     print(f"RMSE: {rmse:.2f} W/m^2")
     print(f"nRMSE: {nrmse:.2%}")
     print(f"MAE: {mae:.2f} W/m^2")
-    print(f"Skill Score (vs 3-Day Persistence): {skill_score:.2f}")
+    print(f"R2 Score: {r2:.4f}")
+    print(f"Skill Score: {skill_score:.2f}")
     
     # Plotting
     os.makedirs("artifacts", exist_ok=True)
     
-    # Plot 1: Sample Forecasts
-    plt.figure(figsize=(15, 10))
-    for i in range(min(3, len(y_test_inv))):
-        plt.subplot(3, 1, i+1)
-        plt.plot(y_test_inv[i], label='Actual', color='black')
-        plt.plot(y_pred_inv[i], label='Forecast (Hybrid)', color='blue')
-        plt.plot(y_persistence_inv[i], label='Persistence', color='gray', linestyle='--')
-        plt.title(f"Sample {i+1}: 3-Day Forecast")
-        plt.ylabel("Irradiance (W/m^2)")
-        plt.legend()
-    plt.tight_layout()
-    plt.savefig("artifacts/forecast_samples.png")
-    print("Saved forecast_samples.png")
+    # Plot first 100 hours of the first sequence in test set (or just first sequence)
+    # y_test_inv shape: (samples, output_window)
+    # Let's plot the first sequence prediction vs actual
+    plt.figure(figsize=(10, 6))
+    plt.plot(y_test_inv[0], label='Actual')
+    plt.plot(y_pred_inv[0], label='Predicted')
+    plt.title(f'Actual vs Predicted GHI ({OUTPUT_WINDOW}h Horizon) - Sample 0')
+    plt.xlabel('Time (Hours)')
+    plt.ylabel('GHI (W/m^2)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"artifacts/pred_vs_actual_{OUTPUT_WINDOW}h.png")
+    plt.close()
     
-    # Plot 2: Scatter Plot
+    # Scatter plot
     plt.figure(figsize=(8, 8))
     plt.scatter(y_test_inv.flatten(), y_pred_inv.flatten(), alpha=0.1, s=1)
-    plt.plot([0, 1200], [0, 1200], 'r--')
-    plt.xlabel("Actual")
-    plt.ylabel("Predicted")
-    plt.title("Actual vs Predicted Irradiance")
-    plt.savefig("artifacts/scatter_plot.png")
-    print("Saved scatter_plot.png")
+    plt.plot([0, 1200], [0, 1200], 'r--') # Diagonal
+    plt.title(f'Scatter Plot ({OUTPUT_WINDOW}h Horizon)')
+    plt.xlabel('Actual GHI')
+    plt.ylabel('Predicted GHI')
+    plt.xlim(0, 1200)
+    plt.ylim(0, 1200)
+    plt.grid(True)
+    plt.savefig(f"artifacts/scatter_{OUTPUT_WINDOW}h.png")
+    plt.close()
+
+    return {
+        "rmse": rmse,
+        "nrmse": nrmse,
+        "mae": mae,
+        "r2": r2,
+        "skill_score": skill_score
+    }
 
 if __name__ == "__main__":
-    evaluate()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_window", type=int, default=72)
+    parser.add_argument("--model_path", type=str, default="models/bilstm_model.pth")
+    args = parser.parse_args()
+    
+    evaluate(output_window=args.output_window, model_path=args.model_path)

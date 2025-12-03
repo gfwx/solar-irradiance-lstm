@@ -7,19 +7,22 @@ import os
 from src.data_processor import DataProcessor
 from src.model import BiLSTM
 
-def train():
+import argparse
+
+def train(output_window=72, model_save_path="models/bilstm_model.pth", epochs=10):
     # Hyperparameters
     BATCH_SIZE = 32
-    EPOCHS = 10 # Reduced for 1-day build speed
-    LEARNING_RATE = 0.001
-    INPUT_WINDOW = 336
-    OUTPUT_WINDOW = 72
+    EPOCHS = epochs
+    LEARNING_RATE = 0.0001
+    INPUT_WINDOW = 144
+    OUTPUT_WINDOW = output_window
     HIDDEN_SIZE = 128
     LAYERS = 2
     DATA_DIR = "/Users/sk/Desktop/proj"
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f"Using device: {device}")
+    print(f"Training for Output Window: {OUTPUT_WINDOW}h, Saving to: {model_save_path}")
     
     # Data Preparation
     processor = DataProcessor(data_dir=DATA_DIR, input_window=INPUT_WINDOW, output_window=OUTPUT_WINDOW)
@@ -78,22 +81,29 @@ def train():
         
     # Plot Loss Curve
     import matplotlib.pyplot as plt
+    os.makedirs("artifacts", exist_ok=True)
+    
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.title(f'Training Loss ({OUTPUT_WINDOW}h Horizon)')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training vs Validation Loss (Overfitting Check)')
+    plt.ylabel('Loss (MSE)')
     plt.legend()
     plt.grid(True)
-    os.makedirs("artifacts", exist_ok=True)
-    plt.savefig("artifacts/loss_curve.png")
-    print("Saved artifacts/loss_curve.png")
+    plt.savefig(f"artifacts/loss_{OUTPUT_WINDOW}h.png")
+    plt.close()
         
     # Save Model
     os.makedirs("models", exist_ok=True)
-    torch.save(model.state_dict(), "models/bilstm_model.pth")
-    print("Model saved to models/bilstm_model.pth")
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_window", type=int, default=72)
+    parser.add_argument("--model_path", type=str, default="models/bilstm_model.pth")
+    parser.add_argument("--epochs", type=int, default=10)
+    args = parser.parse_args()
+    
+    train(output_window=args.output_window, model_save_path=args.model_path, epochs=args.epochs)

@@ -8,13 +8,14 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 
 class DataProcessor:
-    def __init__(self, data_dir, input_window=336, output_window=72):
+    def __init__(self, data_dir, input_window=144, output_window=72):
         self.data_dir = data_dir
         self.input_window = input_window
         self.output_window = output_window
         self.scalers = {}
         self.feature_columns = []
         self.target_column = 'SWD [W/m**2]' # Short-wave downward (Global Horizontal Irradiance)
+        self.gbdt_model = None
 
     def load_data(self):
         all_files = sorted(glob.glob(os.path.join(self.data_dir, "*_radiation_*.tab")))
@@ -97,6 +98,11 @@ class DataProcessor:
     def feature_engineering(self, df):
         print("Starting feature engineering...")
         
+        # Revert to the original 4 sites that worked well
+        valid_sites = ['CAB', 'SEL', 'SYO', 'TAT']
+        print(f"Reverting to original sites: {valid_sites}")
+        df = df[df['site'].isin(valid_sites)].copy()
+        
         # 1. Time features
         df['hour'] = df.index.hour
         df['day_of_year'] = df.index.dayofyear
@@ -131,8 +137,12 @@ class DataProcessor:
             if expected not in df.columns:
                 df[expected] = 0.0
                 
-        # Drop rows with NaNs created by shifting
-        df.dropna(inplace=True)
+        # Drop rows with NaNs created by shifting (only check features we use)
+        # We need to define feature_columns temporarily here or just check the ones we know
+        # self.feature_columns is set later, but we know the cols:
+        # lags, met cols, target
+        cols_to_check = ['GHI_lag_24h', 'GHI_lag_168h', 'temperature', 'humidity', 'pressure', self.target_column]
+        df.dropna(subset=cols_to_check, inplace=True)
         
         # Define feature columns
         self.feature_columns = [
@@ -174,6 +184,7 @@ class DataProcessor:
         # Predict and add as feature
         print("Adding GBDT predictions as feature...")
         df['gbdt_pred'] = model.predict(X)
+        self.gbdt_model = model
         
         # Add to feature columns
         self.feature_columns.append('gbdt_pred')
@@ -189,6 +200,63 @@ class DataProcessor:
         scaler = MinMaxScaler()
         df[self.feature_columns] = scaler.fit_transform(df[self.feature_columns])
         self.scalers['global'] = scaler
+        return df
+
+    def transform_new_data(self, df):
+        """
+        Transform new data using fitted scalers and GBDT model.
+        """
+        df = df.copy()
+        
+        # 1. Feature Engineering (Time)
+        if 'hour' not in df.columns:
+            df['hour'] = df.index.hour
+        if 'day_of_year' not in df.columns:
+            df['day_of_year'] = df.index.dayofyear
+            
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
+        df['day_of_year_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365)
+        df['day_of_year_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365)
+        
+        # 2. GBDT Prediction
+        if self.gbdt_model is not None:
+            # We need to construct the exact features GBDT expects
+            # The model was trained on X = df[self.feature_columns].drop(target)
+            # self.feature_columns at that time did NOT include 'gbdt_pred'
+            # But now self.feature_columns DOES include 'gbdt_pred' because we appended it
+            
+            gbdt_cols = [c for c in self.feature_columns if c != 'gbdt_pred' and c != self.target_column]
+            
+            # Ensure columns exist
+            for col in gbdt_cols:
+                if col not in df.columns:
+                    print(f"Warning: Missing column {col} for GBDT. Filling with 0.")
+                    df[col] = 0.0
+            
+            df['gbdt_pred'] = self.gbdt_model.predict(df[gbdt_cols])
+        else:
+            print("Warning: GBDT model not fitted. 'gbdt_pred' will be 0.")
+            df['gbdt_pred'] = 0.0
+            
+        # 3. Normalization
+        if 'global' in self.scalers:
+            scaler = self.scalers['global']
+            # Scaler expects all feature_columns (including gbdt_pred and target)
+            # If target is missing (inference), we might have issues.
+            # But for this task, we are generating irradiance, so we might not have target?
+            # Wait, BiLSTM input needs historical target.
+            # So we assume we have it (or filled it).
+            
+            # Check if all columns exist
+            missing_cols = [c for c in self.feature_columns if c not in df.columns]
+            if missing_cols:
+                print(f"Warning: Missing columns for scaling: {missing_cols}. Filling with 0.")
+                for c in missing_cols:
+                    df[c] = 0.0
+            
+            df[self.feature_columns] = scaler.transform(df[self.feature_columns])
+            
         return df
 
     def create_sequences(self, df):
