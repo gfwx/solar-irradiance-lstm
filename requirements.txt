@@ -3,3 +3,4 @@ lightgbm
 pandas
 scikit-learn
 matplotlib
+streamlit

@@ -1,0 +1,9 @@
+{
+  "rmse": 114.50163095498218,
+  "nrmse": 0.4485788201290744,
+  "mae": 66.74196227733876,
+  "r2": 0.8651200756484976,
+  "skill_score": 0.7366655146156833,
+  "output_window": 24,
+  "model_path": "/Users/sk/Code/Projects/Archives/solar-irradiance-lstm/models/bilstm_24h.pth"
+}

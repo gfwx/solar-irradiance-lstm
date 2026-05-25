@@ -74,13 +74,13 @@ class DataProcessor:
                 df.replace(r'^\s*$', np.nan, regex=True, inplace=True) # Replace empty strings
                 df = df.apply(pd.to_numeric, errors='coerce') # Convert all to numeric
                 
-                df.fillna(method='ffill', inplace=True)
-                df.fillna(method='bfill', inplace=True)
+                df.ffill(inplace=True)
+                df.bfill(inplace=True)
                 
                 # Resample to hourly
                 # We need to preserve lat/lon/site which are constant
                 # Group by site (and lat/lon) and resample
-                df_hourly = df.resample('H').mean()
+                df_hourly = df.resample('h').mean()
                 df_hourly['site'] = site_code
                 df_hourly['latitude'] = lat
                 df_hourly['longitude'] = lon

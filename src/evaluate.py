@@ -1,12 +1,15 @@
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
+import json
 import os
+
+import matplotlib.pyplot as plt
+import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+
 from src.data_processor import DataProcessor
-from src.model import BiLSTM
+from src.paths import ARTIFACTS_DIR, DATA_DIR
 
 import argparse
+
 
 def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     # Hyperparameters (must match train.py)
@@ -15,25 +18,46 @@ def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     OUTPUT_WINDOW = output_window
     HIDDEN_SIZE = 128
     LAYERS = 2
-    DATA_DIR = "/Users/sk/Desktop/proj"
-    
-    device = torch.device('mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu'))
-    
-    # Load Data
+
+    # Load data before torch — importing torch first can segfault with LightGBM on some builds
     processor = DataProcessor(data_dir=DATA_DIR, input_window=INPUT_WINDOW, output_window=OUTPUT_WINDOW)
     _, _, X_test, y_test = processor.get_data_loaders(batch_size=BATCH_SIZE)
-    
-    # Load Model
+
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    import torch
+
+    torch.set_num_threads(1)
+    from src.model import BiLSTM
+
+    device_pref = os.environ.get("SOLAR_DEVICE", "auto")
+    if device_pref == "cpu":
+        device = torch.device("cpu")
+    elif device_pref == "mps" and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif device_pref == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
     input_size = X_test.shape[2]
     model = BiLSTM(input_size, HIDDEN_SIZE, OUTPUT_WINDOW, num_layers=LAYERS).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(
+        torch.load(model_path, map_location=device, weights_only=True)
+    )
     model.eval()
     
-    # Predict
+    # Predict in batches (full test set at once can be slow or unstable on CPU)
     print(f"Generating predictions for {OUTPUT_WINDOW}h horizon...")
-    X_tensor = torch.Tensor(X_test).to(device)
+    X_f32 = np.ascontiguousarray(X_test, dtype=np.float32)
+    pred_batches = []
     with torch.no_grad():
-        y_pred = model(X_tensor).cpu().numpy()
+        for start in range(0, len(X_f32), BATCH_SIZE):
+            batch = torch.from_numpy(X_f32[start : start + BATCH_SIZE]).to(device)
+            pred_batches.append(model(batch).cpu().numpy())
+    y_pred = np.concatenate(pred_batches, axis=0)
         
     # Inverse Transform
     scaler = processor.scalers['global']
@@ -94,7 +118,7 @@ def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     print(f"Skill Score: {skill_score:.2f}")
     
     # Plotting
-    os.makedirs("artifacts", exist_ok=True)
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
     
     # Plot first 100 hours of the first sequence in test set (or just first sequence)
     # y_test_inv shape: (samples, output_window)
@@ -107,7 +131,7 @@ def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     plt.ylabel('GHI (W/m^2)')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"artifacts/pred_vs_actual_{OUTPUT_WINDOW}h.png")
+    plt.savefig(ARTIFACTS_DIR / f"pred_vs_actual_{OUTPUT_WINDOW}h.png")
     plt.close()
     
     # Scatter plot
@@ -120,16 +144,23 @@ def evaluate(output_window=72, model_path="models/bilstm_model.pth"):
     plt.xlim(0, 1200)
     plt.ylim(0, 1200)
     plt.grid(True)
-    plt.savefig(f"artifacts/scatter_{OUTPUT_WINDOW}h.png")
+    plt.savefig(ARTIFACTS_DIR / f"scatter_{OUTPUT_WINDOW}h.png")
     plt.close()
 
-    return {
-        "rmse": rmse,
-        "nrmse": nrmse,
-        "mae": mae,
-        "r2": r2,
-        "skill_score": skill_score
+    metrics = {
+        "rmse": float(rmse),
+        "nrmse": float(nrmse),
+        "mae": float(mae),
+        "r2": float(r2),
+        "skill_score": float(skill_score),
+        "output_window": OUTPUT_WINDOW,
+        "model_path": model_path,
     }
+    metrics_path = ARTIFACTS_DIR / f"metrics_{OUTPUT_WINDOW}h.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
